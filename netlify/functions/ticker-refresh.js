@@ -70,7 +70,11 @@ const fetchLastDailyCloseFromStooq = async (symbolLower) => {
 };
 
 const safeJsonParse = (s) => {
-  try { return JSON.parse(s); } catch { return null; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
 };
 
 const getQuoteFromStooq = async (sym) => {
@@ -165,59 +169,53 @@ async function refreshAndStore(event) {
     stocksSuccess = true;
   }
 
-  // === MELANION (Stooq) : on tente plusieurs codes ===
-  // IMPORTANT: Melanion ETF = souvent coté sur Euronext Paris => BTC.PA (Yahoo style)
-  // Stooq peut reconnaître certains tickers, donc on teste plusieurs.
-  const melanionCandidates = [
-    "MLNX.PA"   // Melanion (Euronext Paris)
-  ];
+  // =========================
+  // ✅ MELANION (RETOUR AU CODE INITIAL : YAHOO)
+  // =========================
+  // On utilise Yahoo chart (comme ton ancien code qui marchait).
+  // Clé attendue côté front : results.mlnx
+  const MELANION_SYMBOL = "MLNX.PA"; // Melanion Euronext Paris
 
-  let melanionSet = false;
+  try {
+    const res = await fetchWithTimeout(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+        MELANION_SYMBOL
+      )}?interval=1d&range=5d`,
+      9000
+    );
 
-  for (const sym of melanionCandidates) {
-    if (melanionSet) break;
+    if (res.ok) {
+      const json = await res.json();
+      const result = json?.chart?.result?.[0];
 
-    // 1) quote
-    let q = null;
-    try { q = await getQuoteFromStooq(sym); } catch {}
+      if (result) {
+        const prices = result?.indicators?.quote?.[0]?.close || [];
+        const clean = prices.filter((v) => Number.isFinite(v));
 
-    if (q) {
-      results.mlnx = {
-        name: "Melanion",
-        symbol: sym,
-        currentPrice: q.close,
-        changeDayPct: q.changeDayPct || 0,
-        isEuro: true,
-        source: "stooq",
-        last: `${q.date} ${q.time}`,
-      };
-      stocksSuccess = true;
-      melanionSet = true;
-      break;
-    }
+        if (clean.length >= 2) {
+          const last = clean[clean.length - 1];
+          const prev = clean[clean.length - 2] || last;
+          const changeDayPct = prev !== 0 ? ((last / prev) - 1) * 100 : 0;
 
-    // 2) daily close (si quote vide)
-    try {
-      const daily = await fetchLastDailyCloseFromStooq(sym.toLowerCase());
-      if (daily) {
-        results.mlnx = {
-          name: "Melanion",
-          symbol: sym,
-          currentPrice: daily.close,
-          changeDayPct: daily.changeDayPct || 0,
-          isEuro: true,
-          source: "stooq",
-          last: `${daily.date} CLOSE`,
-        };
-        stocksSuccess = true;
-        melanionSet = true;
-        break;
+          results.mlnx = {
+            name: "Melanion",
+            symbol: MELANION_SYMBOL,
+            currentPrice: last,
+            changeDayPct,
+            isEuro: true,
+            source: "yahoo",
+            last: new Date().toISOString(),
+          };
+
+          stocksSuccess = true;
+        }
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
-  // ✅ GARANTIE "DERNIER COURS CONNU"
-  const alwaysKeep = ["mara","btbt","pypl","bmnr","mstr","bitf","mlnx"];
+  // ✅ GARANTIE "DERNIER COURS CONNU" POUR ACTIONS + MELANION
+  // (si marché fermé / API renvoie rien => on garde le dernier stocké sur le serveur)
+  const alwaysKeep = ["mara", "btbt", "pypl", "bmnr", "mstr", "bitf", "mlnx"];
   for (const k of alwaysKeep) {
     if (!results[k] && previousData[k]?.currentPrice) {
       results[k] = previousData[k];
@@ -255,7 +253,7 @@ export const handler = async (event) => {
   try {
     const payload = await refreshAndStore(event);
 
-    // Debug simple si tu veux voir le payload complet
+    // Option debug: renvoie le payload complet
     if (force) {
       return { statusCode: 200, body: JSON.stringify(payload) };
     }
@@ -271,4 +269,3 @@ export const handler = async (event) => {
     };
   }
 };
-
