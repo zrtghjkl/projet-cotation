@@ -169,9 +169,7 @@ async function refreshAndStore(event) {
   // IMPORTANT: Melanion ETF = souvent coté sur Euronext Paris => BTC.PA (Yahoo style)
   // Stooq peut reconnaître certains tickers, donc on teste plusieurs.
   const melanionCandidates = [
-    "BTC.PA",   // ✅ priorité
-    "BTC.MI",   // fallback si tu l’utilisais
-    "BTC.FR"    // fallback
+    "MLNX.PA"   // Melanion (Euronext Paris)
   ];
 
   let melanionSet = false;
