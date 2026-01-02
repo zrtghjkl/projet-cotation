@@ -36,103 +36,104 @@ const parseStooqCSV = (csvText) => {
   return { symbol, date, time, close: closeNum, changeDayPct };
 };
 
-exports.handler = async (event) => {
+async function refreshAndStore(eventForBlobs) {
+  // Blobs init (works in HTTP + scheduled when event is provided)
+  if (eventForBlobs) connectLambda(eventForBlobs);
+
+  const results = {};
+  let stocksSuccess = false;
+
+  // BTC/ETH (CoinGecko)
   try {
-    // ✅ IMPORTANT: init Blobs in Lambda compatibility mode
-    connectLambda(event);
-
-    const results = {};
-    let stocksSuccess = false;
-
-    // BTC/ETH CoinGecko (format identique)
-    try {
-      const cryptoRes = await fetchWithTimeout(
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
-      );
-      if (cryptoRes.ok) {
-        const cryptoData = await cryptoRes.json();
-
-        if (cryptoData.bitcoin) {
-          results.bitcoin = {
-            name: "Bitcoin",
-            currentPrice: cryptoData.bitcoin.usd,
-            change24h: cryptoData.bitcoin.usd_24h_change || 0,
-          };
-        }
-        if (cryptoData.ethereum) {
-          results.ethereum = {
-            name: "Ethereum",
-            currentPrice: cryptoData.ethereum.usd,
-            change24h: cryptoData.ethereum.usd_24h_change || 0,
-          };
-        }
-      }
-    } catch {}
-
-    // Actions US + Melanion (tentative) via Stooq
-    const stockMapping = {
-      "MARA.US": { key: "mara", name: "Marathon Digital" },
-      "BTBT.US": { key: "btbt", name: "Bit Digital" },
-      "PYPL.US": { key: "pypl", name: "PayPal" },
-      "BMNR.US": { key: "bmnr", name: "BMNR" }, // peut être absent => ignoré si N/A
-      "MSTR.US": { key: "mstr", name: "MicroStrategy" },
-      "BITF.US": { key: "bitf", name: "Bitfarms" },
-      "BTC.PA": { key: "mlnx", name: "Melanion", isEuro: true }, // souvent indispo => ignoré si N/A
-    };
-
-    const symbols = Object.keys(stockMapping);
-
-    const responses = await Promise.all(
-      symbols.map(async (sym) => {
-        const url = `https://stooq.com/q/l/?s=${encodeURIComponent(
-          sym
-        )}&f=sd2t2ohlcv&h&e=csv`;
-        try {
-          const r = await fetchWithTimeout(url);
-          if (!r.ok) return null;
-          const text = await r.text();
-          return { sym, text };
-        } catch {
-          return null;
-        }
-      })
+    const cryptoRes = await fetchWithTimeout(
+      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
     );
-
-    for (const item of responses) {
-      if (!item?.text) continue;
-      const parsed = parseStooqCSV(item.text);
-      if (!parsed) continue;
-
-      const mapping = stockMapping[item.sym];
-      if (!mapping) continue;
-
-      results[mapping.key] = {
-        name: mapping.name,
-        symbol: item.sym,
-        currentPrice: parsed.close,
-        changeDayPct: parsed.changeDayPct,
-        isEuro: mapping.isEuro || false,
-        source: "stooq",
-        last: `${parsed.date} ${parsed.time}`,
-      };
-      stocksSuccess = true;
+    if (cryptoRes.ok) {
+      const cryptoData = await cryptoRes.json();
+      if (cryptoData.bitcoin) {
+        results.bitcoin = {
+          name: "Bitcoin",
+          currentPrice: cryptoData.bitcoin.usd,
+          change24h: cryptoData.bitcoin.usd_24h_change || 0,
+        };
+      }
+      if (cryptoData.ethereum) {
+        results.ethereum = {
+          name: "Ethereum",
+          currentPrice: cryptoData.ethereum.usd,
+          change24h: cryptoData.ethereum.usd_24h_change || 0,
+        };
+      }
     }
+  } catch {}
 
-    const payload = {
-      success: true,
-      timestamp: new Date().toISOString(),
-      cacheTtlSeconds: 300,
-      stocksSuccess,
-      data: results,
+  // Stocks (Stooq)
+  const stockMapping = {
+    "MARA.US": { key: "mara", name: "Marathon Digital" },
+    "BTBT.US": { key: "btbt", name: "Bit Digital" },
+    "PYPL.US": { key: "pypl", name: "PayPal" },
+    "BMNR.US": { key: "bmnr", name: "BMNR" },
+    "MSTR.US": { key: "mstr", name: "MicroStrategy" },
+    "BITF.US": { key: "bitf", name: "Bitfarms" },
+    "BTC.PA": { key: "mlnx", name: "Melanion", isEuro: true },
+  };
+
+  const symbols = Object.keys(stockMapping);
+  const responses = await Promise.all(
+    symbols.map(async (sym) => {
+      const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
+      try {
+        const r = await fetchWithTimeout(url);
+        if (!r.ok) return null;
+        return { sym, text: await r.text() };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  for (const item of responses) {
+    if (!item?.text) continue;
+    const parsed = parseStooqCSV(item.text);
+    if (!parsed) continue;
+
+    const mapping = stockMapping[item.sym];
+    if (!mapping) continue;
+
+    results[mapping.key] = {
+      name: mapping.name,
+      symbol: item.sym,
+      currentPrice: parsed.close,
+      changeDayPct: parsed.changeDayPct,
+      isEuro: mapping.isEuro || false,
+      source: "stooq",
+      last: `${parsed.date} ${parsed.time}`,
     };
+    stocksSuccess = true;
+  }
 
-    const store = getStore("ticker-cache");
-    await store.set("latest", JSON.stringify(payload));
+  const payload = {
+    success: true,
+    timestamp: new Date().toISOString(),
+    cacheTtlSeconds: 300,
+    stocksSuccess,
+    data: results,
+  };
 
-    return {
-      statusCode: 200,
-      body: "ok",
-    };
+  const store = getStore("ticker-cache");
+  await store.set("latest", JSON.stringify(payload));
+
+  return payload;
+}
+
+/**
+ * ✅ Scheduled Function entrypoint
+ * Netlify scheduled functions call this handler on schedule.
+ */
+export const handler = async (event) => {
+  try {
+    const payload = await refreshAndStore(event);
+    return { statusCode: 200, body: JSON.stringify({ ok: true, timestamp: payload.timestamp }) };
   } catch (e) {
     return { statusCode: 500, body: e?.message || String(e) };
   }
