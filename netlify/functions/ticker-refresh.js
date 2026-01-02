@@ -165,11 +165,12 @@ async function refreshAndStore(event) {
     stocksSuccess = true;
   }
 
-  // === MELANION (Yahoo: BTC.MI) => on essaye BTC.MI (Stooq) + fallbacks ===
-  // Objectif: LIVE si quote dispo, sinon CLOSE daily, sinon lastKnown (Blobs)
+  // === MELANION (Stooq) : on tente plusieurs codes ===
+  // IMPORTANT: Melanion ETF = souvent coté sur Euronext Paris => BTC.PA (Yahoo style)
+  // Stooq peut reconnaître certains tickers, donc on teste plusieurs.
   const melanionCandidates = [
-    "BTC.MI",   // ✅ ton code Yahoo
-    "BTC.PA",   // fallback
+    "BTC.PA",   // ✅ priorité
+    "BTC.MI",   // fallback si tu l’utilisais
     "BTC.FR"    // fallback
   ];
 
@@ -217,8 +218,7 @@ async function refreshAndStore(event) {
     } catch {}
   }
 
-  // ✅ GARANTIE "DERNIER COURS CONNU" POUR ACTIONS + MELANION
-  // (si marché fermé / API renvoie rien => on garde le dernier stocké sur le serveur)
+  // ✅ GARANTIE "DERNIER COURS CONNU"
   const alwaysKeep = ["mara","btbt","pypl","bmnr","mstr","bitf","mlnx"];
   for (const k of alwaysKeep) {
     if (!results[k] && previousData[k]?.currentPrice) {
@@ -245,6 +245,7 @@ async function refreshAndStore(event) {
 export const handler = async (event) => {
   const key = event?.queryStringParameters?.key;
   const isCron = event?.headers?.["x-nf-scheduled"] === "true";
+  const force = event?.queryStringParameters?.force === "1";
 
   if (!isCron && key !== process.env.REFRESH_KEY) {
     return {
@@ -255,6 +256,12 @@ export const handler = async (event) => {
 
   try {
     const payload = await refreshAndStore(event);
+
+    // Debug simple si tu veux voir le payload complet
+    if (force) {
+      return { statusCode: 200, body: JSON.stringify(payload) };
+    }
+
     return {
       statusCode: 200,
       body: JSON.stringify({ ok: true, timestamp: payload.timestamp }),
@@ -266,3 +273,4 @@ export const handler = async (event) => {
     };
   }
 };
+
