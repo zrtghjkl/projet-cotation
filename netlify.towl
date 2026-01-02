@@ -1,0 +1,6 @@
+[functions]
+  node_bundler = "esbuild"
+
+[[scheduled.functions]]
+  name = "ticker-refresh"
+  schedule = "*/5 * * * *"
