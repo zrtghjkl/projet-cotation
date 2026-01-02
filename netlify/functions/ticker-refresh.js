@@ -10,19 +10,19 @@ const fetchWithTimeout = async (url, ms = 9000) => {
   try {
     return await fetch(url, {
       signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0" }
+      headers: { "User-Agent": "Mozilla/5.0" },
     });
   } finally {
     clearTimeout(t);
   }
 };
 
-const parseStooqCSV = (csvText) => {
+// Stooq quote CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
+const parseStooqQuoteCSV = (csvText) => {
   const text = (csvText || "").trim();
   const lines = text.split("\n");
   if (lines.length < 2) return null;
 
-  // Symbol,Date,Time,Open,High,Low,Close,Volume
   const row = lines[1].split(",");
   if (row.length < 8) return null;
 
@@ -41,21 +41,65 @@ const parseStooqCSV = (csvText) => {
   return { symbol, date, time, close: closeNum, changeDayPct };
 };
 
+// ✅ Fallback daily close (toujours dispo même marché fermé)
+const fetchLastDailyCloseFromStooq = async (symbolLower) => {
+  // CSV daily: Date,Open,High,Low,Close,Volume
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbolLower)}&i=d`;
+  const r = await fetchWithTimeout(url, 9000);
+  if (!r.ok) return null;
+
+  const text = (await r.text()).trim();
+  const lines = text.split("\n");
+  if (lines.length < 3) return null;
+
+  const last = lines[lines.length - 1].split(",");
+  const prev = lines[lines.length - 2].split(",");
+  if (last.length < 5 || prev.length < 5) return null;
+
+  const date = last[0];
+  const close = Number(last[4]);
+  const prevClose = Number(prev[4]);
+
+  if (!Number.isFinite(close)) return null;
+
+  const changeDayPct =
+    Number.isFinite(prevClose) && prevClose !== 0
+      ? ((close - prevClose) / prevClose) * 100
+      : 0;
+
+  return { date, close, changeDayPct };
+};
+
+const safeJsonParse = (s) => {
+  try { return JSON.parse(s); } catch { return null; }
+};
+
 /* =========================
-   LOGIQUE DE REFRESH
+   REFRESH + PERSIST "LAST KNOWN"
 ========================= */
 
 async function refreshAndStore(event) {
-  // Initialisation Blobs (obligatoire)
   connectLambda(event);
+  const store = getStore("ticker-cache");
 
+  // 1) Lire l'ancien cache (pour garder le "dernier cours connu")
+  let previousPayload = null;
+  try {
+    const prevStr = await store.get("latest");
+    previousPayload = safeJsonParse(prevStr);
+  } catch {}
+
+  const previousData = previousPayload?.data || {};
+
+  // 2) On construit les nouveaux résultats
   const results = {};
   let stocksSuccess = false;
 
   // === CRYPTO (CoinGecko) ===
   try {
     const cryptoRes = await fetchWithTimeout(
-      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
+      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
+      9000
     );
     if (cryptoRes.ok) {
       const cryptoData = await cryptoRes.json();
@@ -64,15 +108,14 @@ async function refreshAndStore(event) {
         results.bitcoin = {
           name: "Bitcoin",
           currentPrice: cryptoData.bitcoin.usd,
-          change24h: cryptoData.bitcoin.usd_24h_change || 0
+          change24h: cryptoData.bitcoin.usd_24h_change || 0,
         };
       }
-
       if (cryptoData.ethereum) {
         results.ethereum = {
           name: "Ethereum",
           currentPrice: cryptoData.ethereum.usd,
-          change24h: cryptoData.ethereum.usd_24h_change || 0
+          change24h: cryptoData.ethereum.usd_24h_change || 0,
         };
       }
     }
@@ -86,44 +129,72 @@ async function refreshAndStore(event) {
     "BMNR.US": { key: "bmnr", name: "BMNR" },
     "MSTR.US": { key: "mstr", name: "MicroStrategy" },
     "BITF.US": { key: "bitf", name: "Bitfarms" },
-    "BTC.PA": { key: "mlnx", name: "Melanion", isEuro: true }
+    "BTC.PA":  { key: "mlnx", name: "Melanion", isEuro: true }, // <- Melanion
   };
 
   const symbols = Object.keys(stockMapping);
 
-  const responses = await Promise.all(
+  // 2a) Quote instantané
+  const quoteResponses = await Promise.all(
     symbols.map(async (sym) => {
       const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
       try {
-        const r = await fetchWithTimeout(url);
-        if (!r.ok) return null;
+        const r = await fetchWithTimeout(url, 9000);
+        if (!r.ok) return { sym, text: null };
         return { sym, text: await r.text() };
       } catch {
-        return null;
+        return { sym, text: null };
       }
     })
   );
 
-  for (const item of responses) {
-    if (!item?.text) continue;
-
-    const parsed = parseStooqCSV(item.text);
-    if (!parsed) continue;
-
+  for (const item of quoteResponses) {
     const mapping = stockMapping[item.sym];
     if (!mapping) continue;
+
+    let parsed = item.text ? parseStooqQuoteCSV(item.text) : null;
+
+    // ✅ IMPORTANT : Melanion si quote vide => daily close
+    if (!parsed && item.sym === "BTC.PA") {
+      try {
+        const daily = await fetchLastDailyCloseFromStooq("btc.pa");
+        if (daily) {
+          parsed = {
+            symbol: "BTC.PA",
+            date: daily.date,
+            time: "CLOSE",
+            close: daily.close,
+            changeDayPct: daily.changeDayPct,
+          };
+        }
+      } catch {}
+    }
+
+    if (!parsed) continue;
 
     results[mapping.key] = {
       name: mapping.name,
       symbol: item.sym,
       currentPrice: parsed.close,
-      changeDayPct: parsed.changeDayPct,
+      changeDayPct: parsed.changeDayPct || 0,
       isEuro: mapping.isEuro || false,
       source: "stooq",
-      last: `${parsed.date} ${parsed.time}`
+      last: `${parsed.date} ${parsed.time}`,
     };
 
     stocksSuccess = true;
+  }
+
+  // 3) ✅ MAGIE : si une valeur manque, on garde le dernier cours connu du cache Blobs
+  // (c’est EXACTEMENT ton besoin “fermé => dernier cours connu”)
+  const keysToAlwaysKeep = [
+    "bitcoin","ethereum","mara","btbt","pypl","bmnr","mstr","bitf","mlnx"
+  ];
+
+  for (const k of keysToAlwaysKeep) {
+    if (!results[k] && previousData[k]?.currentPrice) {
+      results[k] = previousData[k];
+    }
   }
 
   const payload = {
@@ -131,28 +202,25 @@ async function refreshAndStore(event) {
     timestamp: new Date().toISOString(),
     cacheTtlSeconds: 300,
     stocksSuccess,
-    data: results
+    data: results,
   };
 
-  const store = getStore("ticker-cache");
   await store.set("latest", JSON.stringify(payload));
-
   return payload;
 }
 
 /* =========================
-   HANDLER (CRON + SÉCURITÉ)
+   HANDLER (CRON + CLÉ)
 ========================= */
 
 export const handler = async (event) => {
-  // 🔒 SÉCURITÉ ABSOLUE
   const key = event?.queryStringParameters?.key;
   const isCron = event?.headers?.["x-nf-scheduled"] === "true";
 
   if (!isCron && key !== process.env.REFRESH_KEY) {
     return {
       statusCode: 401,
-      body: JSON.stringify({ ok: false, error: "Unauthorized" })
+      body: JSON.stringify({ ok: false, error: "Unauthorized" }),
     };
   }
 
@@ -160,12 +228,12 @@ export const handler = async (event) => {
     const payload = await refreshAndStore(event);
     return {
       statusCode: 200,
-      body: JSON.stringify({ ok: true, timestamp: payload.timestamp })
+      body: JSON.stringify({ ok: true, timestamp: payload.timestamp }),
     };
   } catch (e) {
     return {
       statusCode: 500,
-      body: JSON.stringify({ ok: false, error: e?.message || String(e) })
+      body: JSON.stringify({ ok: false, error: e?.message || String(e) }),
     };
   }
 };
