@@ -41,54 +41,71 @@ const parseStooqQuoteCSV = (csvText) => {
   return { symbol, date, time, close: closeNum, changeDayPct };
 };
 
+// Daily CSV: Date,Open,High,Low,Close,Volume
+const fetchLastDailyCloseFromStooq = async (symbolLower) => {
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbolLower)}&i=d`;
+  const r = await fetchWithTimeout(url, 9000);
+  if (!r.ok) return null;
+
+  const text = (await r.text()).trim();
+  const lines = text.split("\n");
+  if (lines.length < 3) return null;
+
+  const last = lines[lines.length - 1].split(",");
+  const prev = lines[lines.length - 2].split(",");
+  if (last.length < 5 || prev.length < 5) return null;
+
+  const date = last[0];
+  const close = Number(last[4]);
+  const prevClose = Number(prev[4]);
+
+  if (!Number.isFinite(close)) return null;
+
+  const changeDayPct =
+    Number.isFinite(prevClose) && prevClose !== 0
+      ? ((close - prevClose) / prevClose) * 100
+      : 0;
+
+  return { date, close, changeDayPct };
+};
+
 const safeJsonParse = (s) => {
   try { return JSON.parse(s); } catch { return null; }
 };
 
-// Extracteurs HTML simples (Borsa Italiana)
-const extractFirstNumberAfter = (html, marker) => {
-  const idx = html.indexOf(marker);
-  if (idx === -1) return null;
-  const slice = html.slice(idx, idx + 200);
-  const m = slice.match(/([-+]?\d+(?:[.,]\d+)?)/);
-  if (!m) return null;
-  return Number(m[1].replace(",", "."));
-};
-
-const extractStatus = (html) => {
-  // Ex: "Status: Inaccessible" ou "Status: Continuous"
-  const m = html.match(/Status:\s*([^<\n\r]+)/i);
-  return m ? m[1].trim() : "";
+const getQuoteFromStooq = async (sym) => {
+  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
+  const r = await fetchWithTimeout(url, 9000);
+  if (!r.ok) return null;
+  const text = await r.text();
+  return parseStooqQuoteCSV(text);
 };
 
 /* =========================
-   REFRESH
+   REFRESH + "LAST KNOWN" SERVER
 ========================= */
 
 async function refreshAndStore(event) {
   connectLambda(event);
   const store = getStore("ticker-cache");
 
-  // Lire ancien cache (dernier cours connu)
+  // Lire ancien cache (pour garder dernier cours connu)
   let previousPayload = null;
   try {
     const prevStr = await store.get("latest");
     previousPayload = safeJsonParse(prevStr);
   } catch {}
-
   const previousData = previousPayload?.data || {};
 
   const results = {};
   let stocksSuccess = false;
 
   // === CRYPTO (CoinGecko) ===
-  // (pas besoin de close, 24/7)
   try {
     const cryptoRes = await fetchWithTimeout(
       "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
       9000
     );
-
     if (cryptoRes.ok) {
       const cryptoData = await cryptoRes.json();
 
@@ -99,7 +116,6 @@ async function refreshAndStore(event) {
           change24h: cryptoData.bitcoin.usd_24h_change || 0,
         };
       }
-
       if (cryptoData.ethereum) {
         results.ethereum = {
           name: "Ethereum",
@@ -111,118 +127,98 @@ async function refreshAndStore(event) {
   } catch {}
 
   // === ACTIONS US (Stooq) ===
-  // Objectif: si Stooq renvoie rien -> on garde le dernier prix connu en Blobs
   const stockMapping = {
-    "MARA.US": { key: "mara", name: "Marathon Digital" },
-    "BTBT.US": { key: "btbt", name: "Bit Digital" },
-    "PYPL.US": { key: "pypl", name: "PayPal" },
-    "BMNR.US": { key: "bmnr", name: "BMNR" },
-    "MSTR.US": { key: "mstr", name: "MicroStrategy" },
-    "BITF.US": { key: "bitf", name: "Bitfarms" },
+    "MARA.US": { key: "mara", name: "Marathon Digital", isEuro: false },
+    "BTBT.US": { key: "btbt", name: "Bit Digital", isEuro: false },
+    "PYPL.US": { key: "pypl", name: "PayPal", isEuro: false },
+    "BMNR.US": { key: "bmnr", name: "BMNR", isEuro: false },
+    "MSTR.US": { key: "mstr", name: "MicroStrategy", isEuro: false },
+    "BITF.US": { key: "bitf", name: "Bitfarms", isEuro: false },
   };
 
+  // 1) Quotes US
   const symbols = Object.keys(stockMapping);
-
   const quoteResponses = await Promise.all(
     symbols.map(async (sym) => {
-      const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
       try {
-        const r = await fetchWithTimeout(url, 9000);
-        if (!r.ok) return { sym, text: null };
-        return { sym, text: await r.text() };
+        const parsed = await getQuoteFromStooq(sym);
+        return { sym, parsed };
       } catch {
-        return { sym, text: null };
+        return { sym, parsed: null };
       }
     })
   );
 
   for (const item of quoteResponses) {
     const mapping = stockMapping[item.sym];
-    if (!mapping) continue;
-
-    const parsed = item.text ? parseStooqQuoteCSV(item.text) : null;
-    if (!parsed) continue;
+    if (!mapping || !item.parsed) continue;
 
     results[mapping.key] = {
       name: mapping.name,
       symbol: item.sym,
-      currentPrice: parsed.close,
-      changeDayPct: parsed.changeDayPct || 0,
+      currentPrice: item.parsed.close,
+      changeDayPct: item.parsed.changeDayPct || 0,
       isEuro: false,
       source: "stooq",
-      last: `${parsed.date} ${parsed.time}`,
+      last: `${item.parsed.date} ${item.parsed.time}`,
     };
-
     stocksSuccess = true;
   }
 
-  // === MELANION (Borsa Italiana / ISIN FR0014002IH8) ===
-  // Yahoo te donne BTC.MI, mais on n’utilise PAS Yahoo (bloque).
-  // Ici: si marché fermé -> on affiche Reference Close (dernier close).
-  // Si open -> on affiche Last Trade.
-  try {
-    const url = "https://www.borsaitaliana.it/borsa/etf/scheda/FR0014002IH8.html?lang=en";
-    const r = await fetchWithTimeout(url, 9000);
-    if (r.ok) {
-      const html = await r.text();
+  // === MELANION (Yahoo: BTC.MI) => on essaye BTC.MI (Stooq) + fallbacks ===
+  // Objectif: LIVE si quote dispo, sinon CLOSE daily, sinon lastKnown (Blobs)
+  const melanionCandidates = [
+    "BTC.MI",   // ✅ ton code Yahoo
+    "BTC.PA",   // fallback
+    "BTC.FR"    // fallback
+  ];
 
-      const status = extractStatus(html); // "Continuous" ou "Inaccessible"
-      const isOpen = /Continuous/i.test(status);
+  let melanionSet = false;
 
-      // Sur cette page, on a (en clair dans le HTML):
-      // - un prix "15.564 +1.43%" (last trade)
-      // - "Reference Close 15.658 - 26/01/02 ..."
-      // - "Closing Price 15.658"
-      const referenceClose = extractFirstNumberAfter(html, "Reference Close");
-      const closingPrice = extractFirstNumberAfter(html, "Closing Price");
+  for (const sym of melanionCandidates) {
+    if (melanionSet) break;
 
-      // Last trade = le premier prix sous le titre (très tôt dans la page)
-      // On récupère le premier nombre qui suit le nom (on simplifie en prenant le 1er float du HTML après </h1>)
-      let lastTrade = null;
-      const h1Index = html.toLowerCase().indexOf("</h1>");
-      if (h1Index !== -1) {
-        const slice = html.slice(h1Index, h1Index + 250);
-        const m = slice.match(/([-+]?\d+(?:[.,]\d+)?)/);
-        if (m) lastTrade = Number(m[1].replace(",", "."));
-      }
+    // 1) quote
+    let q = null;
+    try { q = await getQuoteFromStooq(sym); } catch {}
 
-      // Choix prix:
-      // - si open => lastTrade
-      // - si fermé => referenceClose (ou closingPrice fallback)
-      const price =
-        isOpen
-          ? (Number.isFinite(lastTrade) ? lastTrade : null)
-          : (Number.isFinite(referenceClose) ? referenceClose : (Number.isFinite(closingPrice) ? closingPrice : null));
+    if (q) {
+      results.mlnx = {
+        name: "Melanion",
+        symbol: sym,
+        currentPrice: q.close,
+        changeDayPct: q.changeDayPct || 0,
+        isEuro: true,
+        source: "stooq",
+        last: `${q.date} ${q.time}`,
+      };
+      stocksSuccess = true;
+      melanionSet = true;
+      break;
+    }
 
-      if (Number.isFinite(price)) {
-        // % : si fermé, on calcule vs dernier prix connu (si dispo)
-        // (sinon 0)
-        let changeDayPct = 0;
-        const prev = previousData?.mlnx?.currentPrice;
-        if (!isOpen && Number.isFinite(prev) && prev !== 0) {
-          changeDayPct = ((price - prev) / prev) * 100;
-        } else if (isOpen && Number.isFinite(prev) && prev !== 0) {
-          // open: calc rapide vs prev aussi (plutôt que dépendre d’un parsing fragile du %)
-          changeDayPct = ((price - prev) / prev) * 100;
-        }
-
+    // 2) daily close (si quote vide)
+    try {
+      const daily = await fetchLastDailyCloseFromStooq(sym.toLowerCase());
+      if (daily) {
         results.mlnx = {
           name: "Melanion",
-          symbol: "BTC.MI",          // ✅ on affiche le code Yahoo demandé (mais data vient de Borsa)
-          currentPrice: price,
-          changeDayPct,
+          symbol: sym,
+          currentPrice: daily.close,
+          changeDayPct: daily.changeDayPct || 0,
           isEuro: true,
-          source: "borsaitaliana",
-          last: isOpen ? "LIVE" : "CLOSE",
+          source: "stooq",
+          last: `${daily.date} CLOSE`,
         };
-
         stocksSuccess = true;
+        melanionSet = true;
+        break;
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
-  // ✅ GARANTIE "dernier cours connu" POUR TOUTES LES ACTIONS + MELANION
-  // Si une valeur manque (marché fermé / source down), on garde l’ancienne du cache Blobs.
+  // ✅ GARANTIE "DERNIER COURS CONNU" POUR ACTIONS + MELANION
+  // (si marché fermé / API renvoie rien => on garde le dernier stocké sur le serveur)
   const alwaysKeep = ["mara","btbt","pypl","bmnr","mstr","bitf","mlnx"];
   for (const k of alwaysKeep) {
     if (!results[k] && previousData[k]?.currentPrice) {
@@ -251,13 +247,22 @@ export const handler = async (event) => {
   const isCron = event?.headers?.["x-nf-scheduled"] === "true";
 
   if (!isCron && key !== process.env.REFRESH_KEY) {
-    return { statusCode: 401, body: JSON.stringify({ ok: false, error: "Unauthorized" }) };
+    return {
+      statusCode: 401,
+      body: JSON.stringify({ ok: false, error: "Unauthorized" }),
+    };
   }
 
   try {
     const payload = await refreshAndStore(event);
-    return { statusCode: 200, body: JSON.stringify({ ok: true, timestamp: payload.timestamp }) };
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ ok: true, timestamp: payload.timestamp }),
+    };
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ ok: false, error: e?.message || String(e) }) };
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ ok: false, error: e?.message || String(e) }),
+    };
   }
 };
