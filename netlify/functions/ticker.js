@@ -1,10 +1,10 @@
-import { getStore } from "@netlify/blobs";
+import { connectLambda, getStore } from "@netlify/blobs";
 
 const headers = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
-  "Content-Type": "application/json"
+  "Content-Type": "application/json",
 };
 
 export const handler = async (event) => {
@@ -13,6 +13,9 @@ export const handler = async (event) => {
   }
 
   try {
+    // ✅ IMPORTANT: init Blobs in Lambda compatibility mode
+    connectLambda(event);
+
     const store = getStore("ticker-cache");
     const val = await store.get("latest");
 
@@ -23,8 +26,8 @@ export const handler = async (event) => {
         body: JSON.stringify({
           success: false,
           error: "Cache vide (le refresh n'a pas encore tourné). Attends 5 minutes.",
-          data: {}
-        })
+          data: {},
+        }),
       };
     }
 
@@ -36,8 +39,8 @@ export const handler = async (event) => {
       body: JSON.stringify({
         success: false,
         error: "Erreur lecture cache",
-        details: e?.message || String(e)
-      })
+        details: e?.message || String(e),
+      }),
     };
   }
 };
