@@ -140,7 +140,7 @@ async function refreshAndStore(event) {
     "BITF.US": { key: "bitf", name: "Bitfarms", isEuro: false },
   };
 
-  // 1) Quotes US
+  // Quotes US
   const symbols = Object.keys(stockMapping);
   const quoteResponses = await Promise.all(
     symbols.map(async (sym) => {
@@ -170,17 +170,17 @@ async function refreshAndStore(event) {
   }
 
   // =========================
-  // ✅ MELANION (RETOUR AU CODE INITIAL : YAHOO)
-  // =========================
-  // On utilise Yahoo chart (comme ton ancien code qui marchait).
+  // ✅ MELANION (YAHOO) — COMME SUR YAHOO FINANCE
+  // Ticker Yahoo: BTC.MI (Milan, EUR) — "Mélanion BTC Equities Universe UCITS ETF"
   // Clé attendue côté front : results.mlnx
-  const MELANION_SYMBOL = "MLNX.PA"; // Melanion Euronext Paris
+  // =========================
+  const MELANION_SYMBOL = "BTC.MI";
 
   try {
     const res = await fetchWithTimeout(
       `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
         MELANION_SYMBOL
-      )}?interval=1d&range=5d`,
+      )}?interval=1d&range=10d`,
       9000
     );
 
