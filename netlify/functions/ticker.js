@@ -5,13 +5,14 @@ const headers = {
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
   "Content-Type": "application/json",
-  "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
+  "Cache-Control": "public, s-maxage=0, max-age=0, must-revalidate",
+  "Netlify-CDN-Cache-Control": "public, s-maxage=0, max-age=0, must-revalidate",
   "Pragma": "no-cache",
   "Expires": "0",
-  "Surrogate-Control": "no-store",
 };
 
 const TTL_MS = 300_000; // 5 minutes
+const REFRESH_TIMEOUT = 10_000; // 10 secondes max
 
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
@@ -21,36 +22,127 @@ export const handler = async (event) => {
   connectLambda(event);
   const store = getStore("ticker-cache");
 
-  let payload = null;
+  const now = Date.now();
+  let cachedData = null;
+  let liveData = null;
 
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 1️⃣ LECTURE DU CACHE (DERNIER COURS CONNU)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   try {
     const raw = await store.get("latest");
-    if (raw) payload = JSON.parse(raw);
-  } catch {}
+    if (raw) {
+      cachedData = JSON.parse(raw);
+      console.log("[TICKER] 💾 Cache chargé:", cachedData.timestamp);
+    }
+  } catch (e) {
+    console.error("[TICKER] ❌ Erreur lecture cache:", e?.message);
+  }
 
-  const now = Date.now();
-  const lastTs = payload?.timestamp ? new Date(payload.timestamp).getTime() : 0;
-  const isStale = !lastTs || now - lastTs > TTL_MS;
+  const cacheAge = cachedData?.timestamp 
+    ? now - new Date(cachedData.timestamp).getTime() 
+    : Infinity;
+  
+  const isStale = cacheAge > TTL_MS;
 
-  // 🔥 Si cache vieux -> on déclenche un refresh côté serveur
+  console.log(`[TICKER] Cache age: ${Math.round(cacheAge / 1000)}s | Stale: ${isStale}`);
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 2️⃣ SI CACHE PÉRIMÉ → TENTER REFRESH LIVE
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (isStale) {
+    console.log("[TICKER] 🔄 Cache obsolète → Tentative refresh live...");
+
     try {
-      await fetch(
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REFRESH_TIMEOUT);
+
+      const refreshResponse = await fetch(
         `https://${event.headers.host}/.netlify/functions/ticker-refresh`,
-        { headers: { "x-nf-scheduled": "true" } }
+        {
+          method: "POST",
+          headers: { 
+            "x-nf-scheduled": "true",
+            "Content-Type": "application/json"
+          },
+          signal: controller.signal
+        }
       );
 
-      const refreshed = await store.get("latest");
-      if (refreshed) payload = JSON.parse(refreshed);
+      clearTimeout(timeoutId);
+
+      if (refreshResponse.ok) {
+        const refreshResult = await refreshResponse.json();
+        
+        if (refreshResult.success) {
+          // ✅ REFRESH RÉUSSI → RELIRE LE BLOB MIS À JOUR
+          const freshRaw = await store.get("latest");
+          if (freshRaw) {
+            liveData = JSON.parse(freshRaw);
+            console.log("[TICKER] ✅ Données LIVE récupérées:", liveData.timestamp);
+          }
+        }
+      }
+
     } catch (e) {
-      // si refresh échoue, on sert quand même ce qu'on a
-      console.log("AUTO-REFRESH ERROR:", e?.message || String(e));
+      if (e.name === 'AbortError') {
+        console.error("[TICKER] ⏱️ Refresh timeout");
+      } else {
+        console.error("[TICKER] ❌ Refresh error:", e?.message);
+      }
+      // On continue avec le cache
     }
   }
 
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 3️⃣ LOGIQUE DE PRIORITÉ : LIVE > CACHE > VIDE
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  let finalData = null;
+  let dataSource = "none";
+
+  if (liveData && liveData.data) {
+    // ✅ PRIORITÉ 1 : Données live (marché ouvert)
+    finalData = liveData;
+    dataSource = "live";
+  } else if (cachedData && cachedData.data) {
+    // ✅ PRIORITÉ 2 : Dernier cours connu (marché fermé)
+    finalData = cachedData;
+    dataSource = "cached";
+  } else {
+    // ❌ PRIORITÉ 3 : Aucune donnée disponible
+    finalData = {
+      success: false,
+      timestamp: new Date().toISOString(),
+      data: {}
+    };
+    dataSource = "empty";
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 4️⃣ RÉPONSE AVEC MÉTADONNÉES
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const response = {
+    success: !!finalData.data && Object.keys(finalData.data).length > 0,
+    data: finalData.data || {},
+    meta: {
+      timestamp: finalData.timestamp,
+      source: dataSource, // "live", "cached", ou "empty"
+      age: finalData.timestamp 
+        ? Math.round((now - new Date(finalData.timestamp).getTime()) / 1000)
+        : null,
+      serverTime: new Date().toISOString()
+    }
+  };
+
+  console.log(`[TICKER] 📤 Réponse envoyée (source: ${dataSource})`);
+
   return {
     statusCode: 200,
-    headers,
-    body: JSON.stringify(payload || { success: false, data: {} }),
+    headers: {
+      ...headers,
+      "X-Data-Source": dataSource,
+      "X-Cache-Age": response.meta.age ? String(response.meta.age) : "0"
+    },
+    body: JSON.stringify(response)
   };
 };
