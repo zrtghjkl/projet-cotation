@@ -41,34 +41,6 @@ const parseStooqQuoteCSV = (csvText) => {
   return { symbol, date, time, close: closeNum, changeDayPct };
 };
 
-// Daily CSV: Date,Open,High,Low,Close,Volume
-const fetchLastDailyCloseFromStooq = async (symbolLower) => {
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbolLower)}&i=d`;
-  const r = await fetchWithTimeout(url, 9000);
-  if (!r.ok) return null;
-
-  const text = (await r.text()).trim();
-  const lines = text.split("\n");
-  if (lines.length < 3) return null;
-
-  const last = lines[lines.length - 1].split(",");
-  const prev = lines[lines.length - 2].split(",");
-  if (last.length < 5 || prev.length < 5) return null;
-
-  const date = last[0];
-  const close = Number(last[4]);
-  const prevClose = Number(prev[4]);
-
-  if (!Number.isFinite(close)) return null;
-
-  const changeDayPct =
-    Number.isFinite(prevClose) && prevClose !== 0
-      ? ((close - prevClose) / prevClose) * 100
-      : 0;
-
-  return { date, close, changeDayPct };
-};
-
 const safeJsonParse = (s) => {
   try {
     return JSON.parse(s);
@@ -127,8 +99,14 @@ async function refreshAndStore(event) {
           change24h: cryptoData.ethereum.usd_24h_change || 0,
         };
       }
+    } else {
+      // debug utile
+      const t = await cryptoRes.text().catch(() => "");
+      console.log("CoinGecko not ok:", cryptoRes.status, t?.slice?.(0, 200));
     }
-  } catch {}
+  } catch (e) {
+    console.log("CRYPTO ERROR:", e?.message || String(e));
+  }
 
   // === ACTIONS US (Stooq) ===
   const stockMapping = {
@@ -140,14 +118,14 @@ async function refreshAndStore(event) {
     "BITF.US": { key: "bitf", name: "Bitfarms", isEuro: false },
   };
 
-  // Quotes US
   const symbols = Object.keys(stockMapping);
   const quoteResponses = await Promise.all(
     symbols.map(async (sym) => {
       try {
         const parsed = await getQuoteFromStooq(sym);
         return { sym, parsed };
-      } catch {
+      } catch (e) {
+        console.log("STOOQ ERROR", sym, e?.message || String(e));
         return { sym, parsed: null };
       }
     })
@@ -169,13 +147,8 @@ async function refreshAndStore(event) {
     stocksSuccess = true;
   }
 
-  // =========================
-  // ✅ MELANION (YAHOO) — COMME SUR YAHOO FINANCE
-  // Ticker Yahoo: BTC.MI (Milan, EUR) — "Mélanion BTC Equities Universe UCITS ETF"
-  // Clé attendue côté front : results.mlnx
-  // =========================
+  // === MELANION (Yahoo) ===
   const MELANION_SYMBOL = "BTC.MI";
-
   try {
     const res = await fetchWithTimeout(
       `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
@@ -210,12 +183,16 @@ async function refreshAndStore(event) {
           stocksSuccess = true;
         }
       }
+    } else {
+      const t = await res.text().catch(() => "");
+      console.log("YAHOO not ok:", res.status, t?.slice?.(0, 200));
     }
-  } catch {}
+  } catch (e) {
+    console.log("YAHOO ERROR:", e?.message || String(e));
+  }
 
-  // ✅ GARANTIE "DERNIER COURS CONNU" POUR ACTIONS + MELANION
-  // (si marché fermé / API renvoie rien => on garde le dernier stocké sur le serveur)
-  const alwaysKeep = ["mara", "btbt", "pypl", "bmnr", "mstr", "bitf", "mlnx"];
+  // ✅ GARANTIE "DERNIER COURS CONNU" (inclut crypto aussi)
+  const alwaysKeep = ["bitcoin","ethereum","mara","btbt","pypl","bmnr","mstr","bitf","mlnx"];
   for (const k of alwaysKeep) {
     if (!results[k] && previousData[k]?.currentPrice) {
       results[k] = previousData[k];
@@ -240,7 +217,14 @@ async function refreshAndStore(event) {
 
 export const handler = async (event) => {
   const key = event?.queryStringParameters?.key;
-  const isCron = event?.headers?.["x-nf-scheduled"] === "true";
+
+  // ✅ cron header robuste
+  const h = event?.headers || {};
+  const isCron =
+    h["x-nf-scheduled"] === "true" ||
+    h["X-Nf-Scheduled"] === "true" ||
+    h["x-nf-scheduled"] === true;
+
   const force = event?.queryStringParameters?.force === "1";
 
   if (!isCron && key !== process.env.REFRESH_KEY) {
@@ -253,18 +237,23 @@ export const handler = async (event) => {
   try {
     const payload = await refreshAndStore(event);
 
-    // Option debug: renvoie le payload complet
     if (force) {
-      return { statusCode: 200, body: JSON.stringify(payload) };
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      };
     }
 
     return {
       statusCode: 200,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ok: true, timestamp: payload.timestamp }),
     };
   } catch (e) {
     return {
       statusCode: 500,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ok: false, error: e?.message || String(e) }),
     };
   }
