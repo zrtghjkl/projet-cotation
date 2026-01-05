@@ -1,43 +1,89 @@
 import { connectLambda, getStore } from "@netlify/blobs";
 
-// ✅ Tes APIs (adapte selon tes besoins)
 const COINGECKO_API = 'https://api.coingecko.com/api/v3/simple/price';
 const YAHOO_API = 'https://query1.finance.yahoo.com/v8/finance/chart';
 
 export const handler = async (event) => {
-  console.log("[REFRESH] 🚀 Démarrage du refresh...");
+  // ✅ Détecte si c'est un appel CRON ou manuel
+  const isCron = event.headers?.['x-nf-scheduled'] === 'true';
+  const source = isCron ? 'CRON' : 'MANUAL';
+  
+  console.log(`[REFRESH] 🚀 Démarrage (source: ${source})`);
 
   connectLambda(event);
   const store = getStore("ticker-cache");
 
   try {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1️⃣ RÉCUPÉRER LES COURS EN TEMPS RÉEL
+    // 1️⃣ LIRE LE CACHE ACTUEL (dernier cours connu)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    let currentData = {};
+    try {
+      const raw = await store.get("latest");
+      if (raw) {
+        const cached = JSON.parse(raw);
+        currentData = cached.data || {};
+        const age = Date.now() - new Date(cached.timestamp).getTime();
+        console.log(`[REFRESH] 💾 Cache actuel: ${Math.round(age / 1000)}s`);
+      }
+    } catch (e) {
+      console.log("[REFRESH] ℹ️ Aucun cache existant");
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2️⃣ RÉCUPÉRER LES NOUVEAUX COURS
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const [cryptoData, stocksData] = await Promise.all([
       fetchCryptoPrices(),
       fetchStockPrices()
     ]);
 
-    const allData = {
-      ...cryptoData,
-      ...stocksData
-    };
-
-    console.log("[REFRESH] 📊 Données récupérées:", Object.keys(allData));
+    console.log("[REFRESH] 📊 Cryptos:", Object.keys(cryptoData));
+    console.log("[REFRESH] 📊 Actions:", Object.keys(stocksData));
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 2️⃣ SAUVEGARDER DANS LE BLOB (= DERNIER COURS CONNU)
+    // 3️⃣ FUSION : Nouveau cours > Ancien cours
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const mergedData = { ...currentData };
+    let updateCount = 0;
+
+    // Cryptos (toujours live 24/7)
+    Object.keys(cryptoData).forEach(key => {
+      if (cryptoData[key]?.currentPrice !== null) {
+        mergedData[key] = cryptoData[key];
+        updateCount++;
+        console.log(`[REFRESH] ✅ ${key} = $${cryptoData[key].currentPrice} (crypto)`);
+      }
+    });
+
+    // Actions (seulement si prix frais < 1h)
+    Object.keys(stocksData).forEach(key => {
+      if (stocksData[key] !== null && stocksData[key]?.currentPrice !== null) {
+        mergedData[key] = stocksData[key];
+        updateCount++;
+        console.log(`[REFRESH] ✅ ${key} = $${stocksData[key].currentPrice} (action)`);
+      } else if (mergedData[key]) {
+        console.log(`[REFRESH] ⚠️ ${key} = $${mergedData[key].currentPrice} (cache)`);
+      }
+    });
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 4️⃣ SAUVEGARDE DANS LE BLOB (TOUJOURS)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const payload = {
       success: true,
       timestamp: new Date().toISOString(),
-      data: allData
+      data: mergedData,
+      meta: {
+        source: source,
+        updated: updateCount,
+        total: Object.keys(mergedData).length
+      }
     };
 
     await store.set("latest", JSON.stringify(payload));
 
-    console.log("[REFRESH] ✅ Blob mis à jour avec succès");
+    console.log(`[REFRESH] ✅ Blob sauvegardé (${updateCount}/${Object.keys(mergedData).length} mis à jour)`);
 
     return {
       statusCode: 200,
@@ -45,26 +91,26 @@ export const handler = async (event) => {
       body: JSON.stringify({
         success: true,
         timestamp: payload.timestamp,
-        count: Object.keys(allData).length
+        updated: updateCount,
+        total: Object.keys(mergedData).length
       })
     };
 
   } catch (error) {
     console.error("[REFRESH] ❌ Erreur:", error);
-
     return {
       statusCode: 500,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        success: false,
-        error: error.message
+      body: JSON.stringify({ 
+        success: false, 
+        error: error.message 
       })
     };
   }
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FONCTION : RÉCUPÉRER LES CRYPTOS (Bitcoin, Ethereum)
+// CRYPTOS (Bitcoin, Ethereum) - 24/7
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function fetchCryptoPrices() {
   try {
@@ -91,86 +137,67 @@ async function fetchCryptoPrices() {
     };
 
   } catch (error) {
-    console.error("[REFRESH] ❌ CoinGecko error:", error.message);
+    console.error("[CRYPTO] ❌", error.message);
     return {};
   }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FONCTION : RÉCUPÉRER LES ACTIONS (MARA, MSTR, etc.)
+// ACTIONS (MARA, MSTR, etc.) - Avec vérification fraîcheur
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function fetchStockPrices() {
-  const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF'];
+  const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF', 'BMNR'];
   const results = {};
+  const now = Date.now() / 1000;
 
-  try {
-    const promises = symbols.map(async (symbol) => {
-      try {
-        const response = await fetch(
-          `${YAHOO_API}/${symbol}?interval=1d&range=2d`,
-          { signal: AbortSignal.timeout(5000) }
-        );
+  for (const symbol of symbols) {
+    try {
+      const response = await fetch(
+        `${YAHOO_API}/${symbol}?interval=1d&range=2d`,
+        { signal: AbortSignal.timeout(5000) }
+      );
 
-        if (!response.ok) throw new Error(`Yahoo: ${response.status}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-        const data = await response.json();
-        const quote = data?.chart?.result?.[0];
-        const meta = quote?.meta;
-        const prices = quote?.indicators?.quote?.[0];
+      const data = await response.json();
+      const quote = data?.chart?.result?.[0];
+      const meta = quote?.meta;
+      const prices = quote?.indicators?.quote?.[0];
 
-        if (meta && prices) {
-          const currentPrice = meta.regularMarketPrice || prices.close?.[prices.close.length - 1];
-          const previousClose = meta.chartPreviousClose || meta.previousClose;
-          
+      if (meta && prices) {
+        const currentPrice = meta.regularMarketPrice || prices.close?.[prices.close.length - 1];
+        const previousClose = meta.chartPreviousClose || meta.previousClose;
+        const marketTime = meta.regularMarketTime;
+
+        // 🔥 Vérification : Prix frais (< 1 heure) ?
+        const ageSeconds = now - marketTime;
+        const ageMinutes = Math.round(ageSeconds / 60);
+        const isFresh = ageSeconds < 3600; // < 1 heure
+
+        console.log(`[${symbol}] $${currentPrice} | Âge: ${ageMinutes}min | Frais: ${isFresh}`);
+
+        if (isFresh) {
+          // ✅ Prix récent (marché ouvert)
           const changePct = previousClose 
             ? ((currentPrice - previousClose) / previousClose) * 100 
             : 0;
 
           results[symbol.toLowerCase()] = {
-            currentPrice: currentPrice || null,
-            changeDayPct: changePct || null,
+            currentPrice: currentPrice,
+            changeDayPct: changePct,
             isEuro: false
           };
+        } else {
+          // ⚠️ Prix obsolète (marché fermé) → On garde l'ancien
+          results[symbol.toLowerCase()] = null;
         }
-
-      } catch (error) {
-        console.error(`[REFRESH] ❌ ${symbol} error:`, error.message);
       }
-    });
 
-    await Promise.allSettled(promises);
-
-  } catch (error) {
-    console.error("[REFRESH] ❌ Stocks error:", error.message);
+    } catch (error) {
+      console.error(`[${symbol}] ❌`, error.message);
+      results[symbol.toLowerCase()] = null;
+    }
   }
 
   return results;
 }
-```
-
----
-
-## 🎯 **LOGIQUE FINALE**
-
-### **Scénario 1 : Marché ouvert (lundi 14h)**
-```
-1. Cache vieux de 10 min → isStale = true
-2. Appel ticker-refresh → Récupère cours live
-3. Sauvegarde dans Blob
-4. Renvoie données LIVE (source: "live")
-```
-
-### **Scénario 2 : Marché fermé (samedi 14h)**
-```
-1. Cache vieux de 10 min → isStale = true
-2. Appel ticker-refresh → APIs renvoient "market closed"
-3. Blob NON mis à jour (garde dernier cours de vendredi)
-4. Renvoie données CACHED (source: "cached")
-```
-
-### **Scénario 3 : Premier démarrage (pas de cache)**
-```
-1. Aucun cache → cachedData = null
-2. Appel ticker-refresh → Récupère cours live
-3. Sauvegarde dans Blob
-4. Renvoie données LIVE (source: "live")
