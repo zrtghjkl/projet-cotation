@@ -7,12 +7,7 @@ const headers = {
   "Content-Type": "application/json",
   "Cache-Control": "public, s-maxage=0, max-age=0, must-revalidate",
   "Netlify-CDN-Cache-Control": "public, s-maxage=0, max-age=0, must-revalidate",
-  "Pragma": "no-cache",
-  "Expires": "0",
 };
-
-const TTL_MS = 300_000; // 5 minutes
-const REFRESH_TIMEOUT = 10_000; // 10 secondes max
 
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
@@ -22,127 +17,79 @@ export const handler = async (event) => {
   connectLambda(event);
   const store = getStore("ticker-cache");
 
-  const now = Date.now();
-  let cachedData = null;
-  let liveData = null;
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 1️⃣ LECTURE DU CACHE (DERNIER COURS CONNU)
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   try {
+    // ✅ LECTURE DU BLOB (mis à jour par le CRON)
     const raw = await store.get("latest");
-    if (raw) {
-      cachedData = JSON.parse(raw);
-      console.log("[TICKER] 💾 Cache chargé:", cachedData.timestamp);
+    
+    if (!raw) {
+      return {
+        statusCode: 404,
+        headers,
+        body: JSON.stringify({ 
+          success: false, 
+          error: "Aucune donnée disponible" 
+        })
+      };
     }
-  } catch (e) {
-    console.error("[TICKER] ❌ Erreur lecture cache:", e?.message);
-  }
 
-  const cacheAge = cachedData?.timestamp 
-    ? now - new Date(cachedData.timestamp).getTime() 
-    : Infinity;
-  
-  const isStale = cacheAge > TTL_MS;
+    const payload = JSON.parse(raw);
+    const age = Date.now() - new Date(payload.timestamp).getTime();
 
-  console.log(`[TICKER] Cache age: ${Math.round(cacheAge / 1000)}s | Stale: ${isStale}`);
+    console.log(`[TICKER] 📦 Blob lu (âge: ${Math.round(age / 1000)}s)`);
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 2️⃣ SI CACHE PÉRIMÉ → TENTER REFRESH LIVE
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  if (isStale) {
-    console.log("[TICKER] 🔄 Cache obsolète → Tentative refresh live...");
-
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), REFRESH_TIMEOUT);
-
-      const refreshResponse = await fetch(
-        `https://${event.headers.host}/.netlify/functions/ticker-refresh`,
-        {
-          method: "POST",
-          headers: { 
-            "x-nf-scheduled": "true",
-            "Content-Type": "application/json"
-          },
-          signal: controller.signal
-        }
-      );
-
-      clearTimeout(timeoutId);
-
-      if (refreshResponse.ok) {
-        const refreshResult = await refreshResponse.json();
-        
-        if (refreshResult.success) {
-          // ✅ REFRESH RÉUSSI → RELIRE LE BLOB MIS À JOUR
-          const freshRaw = await store.get("latest");
-          if (freshRaw) {
-            liveData = JSON.parse(freshRaw);
-            console.log("[TICKER] ✅ Données LIVE récupérées:", liveData.timestamp);
-          }
-        }
-      }
-
-    } catch (e) {
-      if (e.name === 'AbortError') {
-        console.error("[TICKER] ⏱️ Refresh timeout");
-      } else {
-        console.error("[TICKER] ❌ Refresh error:", e?.message);
-      }
-      // On continue avec le cache
-    }
-  }
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 3️⃣ LOGIQUE DE PRIORITÉ : LIVE > CACHE > VIDE
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  let finalData = null;
-  let dataSource = "none";
-
-  if (liveData && liveData.data) {
-    // ✅ PRIORITÉ 1 : Données live (marché ouvert)
-    finalData = liveData;
-    dataSource = "live";
-  } else if (cachedData && cachedData.data) {
-    // ✅ PRIORITÉ 2 : Dernier cours connu (marché fermé)
-    finalData = cachedData;
-    dataSource = "cached";
-  } else {
-    // ❌ PRIORITÉ 3 : Aucune donnée disponible
-    finalData = {
-      success: false,
-      timestamp: new Date().toISOString(),
-      data: {}
+    return {
+      statusCode: 200,
+      headers: {
+        ...headers,
+        "X-Cache-Age": String(Math.round(age / 1000)),
+        "X-Data-Source": payload.meta?.source || "unknown"
+      },
+      body: JSON.stringify(payload)
     };
-    dataSource = "empty";
+
+  } catch (error) {
+    console.error("[TICKER] ❌", error);
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({ 
+        success: false, 
+        error: error.message 
+      })
+    };
   }
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 4️⃣ RÉPONSE AVEC MÉTADONNÉES
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  const response = {
-    success: !!finalData.data && Object.keys(finalData.data).length > 0,
-    data: finalData.data || {},
-    meta: {
-      timestamp: finalData.timestamp,
-      source: dataSource, // "live", "cached", ou "empty"
-      age: finalData.timestamp 
-        ? Math.round((now - new Date(finalData.timestamp).getTime()) / 1000)
-        : null,
-      serverTime: new Date().toISOString()
-    }
-  };
-
-  console.log(`[TICKER] 📤 Réponse envoyée (source: ${dataSource})`);
-
-  return {
-    statusCode: 200,
-    headers: {
-      ...headers,
-      "X-Data-Source": dataSource,
-      "X-Cache-Age": response.meta.age ? String(response.meta.age) : "0"
-    },
-    body: JSON.stringify(response)
-  };
 };
+```
+
+---
+
+## 🎯 **COMMENT ÇA MARCHE MAINTENANT**
+
+### **Scénario 1 : Vendredi 20h59 (juste avant clôture)**
+```
+🤖 CRON exécute ticker-refresh.js
+↓
+Yahoo Finance renvoie : MARA = $18.45 (frais < 1h)
+↓
+💾 BLOB sauvegardé avec MARA = $18.45
+```
+
+### **Scénario 2 : Vendredi 21h05 (marché fermé)**
+```
+🤖 CRON exécute ticker-refresh.js
+↓
+Yahoo Finance renvoie : MARA = $18.45 (obsolète > 1h)
+↓
+⚠️ Prix ignoré (garde l'ancien du blob)
+↓
+💾 BLOB garde MARA = $18.45 (cours de clôture)
+```
+
+### **Scénario 3 : Samedi 14h (marché fermé)**
+```
+👤 Client ouvre le site
+↓
+ticker.js lit le BLOB
+↓
+✅ Affiche MARA = $18.45 (dernier cours du vendredi)
+✅ Affiche BTC = $96234.12 (cours live du samedi)
