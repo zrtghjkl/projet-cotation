@@ -1,268 +1,219 @@
 import { connectLambda, getStore } from "@netlify/blobs";
 
-/* =========================
-   OUTILS
-========================= */
+const COINGECKO_API = 'https://api.coingecko.com/api/v3/simple/price';
+const YAHOO_API = 'https://query1.finance.yahoo.com/v8/finance/chart';
 
-const fetchWithTimeout = async (url, ms = 9000) => {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, {
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-  } finally {
-    clearTimeout(t);
-  }
-};
+export const handler = async (event) => {
+  const isCron = event.headers?.['x-nf-scheduled'] === 'true';
+  const source = isCron ? 'CRON' : 'MANUAL';
+  
+  console.log(`[REFRESH] 🚀 Démarrage (source: ${source})`);
 
-// Stooq quote CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
-const parseStooqQuoteCSV = (csvText) => {
-  const text = (csvText || "").trim();
-  const lines = text.split("\n");
-  if (lines.length < 2) return null;
-
-  const row = lines[1].split(",");
-  if (row.length < 8) return null;
-
-  const [symbol, date, time, open, high, low, close] = row;
-  if (!symbol || close === "N/A") return null;
-
-  const closeNum = Number(close);
-  const openNum = Number(open);
-  if (!Number.isFinite(closeNum)) return null;
-
-  const changeDayPct =
-    Number.isFinite(openNum) && openNum !== 0
-      ? ((closeNum - openNum) / openNum) * 100
-      : 0;
-
-  return { symbol, date, time, close: closeNum, changeDayPct };
-};
-
-// Daily CSV: Date,Open,High,Low,Close,Volume
-const fetchLastDailyCloseFromStooq = async (symbolLower) => {
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbolLower)}&i=d`;
-  const r = await fetchWithTimeout(url, 9000);
-  if (!r.ok) return null;
-
-  const text = (await r.text()).trim();
-  const lines = text.split("\n");
-  if (lines.length < 3) return null;
-
-  const last = lines[lines.length - 1].split(",");
-  const prev = lines[lines.length - 2].split(",");
-  if (last.length < 5 || prev.length < 5) return null;
-
-  const date = last[0];
-  const close = Number(last[4]);
-  const prevClose = Number(prev[4]);
-
-  if (!Number.isFinite(close)) return null;
-
-  const changeDayPct =
-    Number.isFinite(prevClose) && prevClose !== 0
-      ? ((close - prevClose) / prevClose) * 100
-      : 0;
-
-  return { date, close, changeDayPct };
-};
-
-const safeJsonParse = (s) => {
-  try { return JSON.parse(s); } catch { return null; }
-};
-
-const getQuoteFromStooq = async (sym) => {
-  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
-  const r = await fetchWithTimeout(url, 9000);
-  if (!r.ok) return null;
-  const text = await r.text();
-  return parseStooqQuoteCSV(text);
-};
-
-/* =========================
-   REFRESH + "LAST KNOWN" SERVER
-========================= */
-
-async function refreshAndStore(event) {
   connectLambda(event);
   const store = getStore("ticker-cache");
 
-  // Lire ancien cache (pour garder dernier cours connu)
-  let previousPayload = null;
   try {
-    const prevStr = await store.get("latest");
-    previousPayload = safeJsonParse(prevStr);
-  } catch {}
-  const previousData = previousPayload?.data || {};
-
-  const results = {};
-  let stocksSuccess = false;
-
-  // === CRYPTO (CoinGecko) ===
-  try {
-    const cryptoRes = await fetchWithTimeout(
-      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
-      9000
-    );
-    if (cryptoRes.ok) {
-      const cryptoData = await cryptoRes.json();
-
-      if (cryptoData.bitcoin) {
-        results.bitcoin = {
-          name: "Bitcoin",
-          currentPrice: cryptoData.bitcoin.usd,
-          change24h: cryptoData.bitcoin.usd_24h_change || 0,
-        };
-      }
-      if (cryptoData.ethereum) {
-        results.ethereum = {
-          name: "Ethereum",
-          currentPrice: cryptoData.ethereum.usd,
-          change24h: cryptoData.ethereum.usd_24h_change || 0,
-        };
-      }
-    }
-  } catch {}
-
-  // === ACTIONS US (Stooq) ===
-  const stockMapping = {
-    "MARA.US": { key: "mara", name: "Marathon Digital", isEuro: false },
-    "BTBT.US": { key: "btbt", name: "Bit Digital", isEuro: false },
-    "PYPL.US": { key: "pypl", name: "PayPal", isEuro: false },
-    "BMNR.US": { key: "bmnr", name: "BMNR", isEuro: false },
-    "MSTR.US": { key: "mstr", name: "MicroStrategy", isEuro: false },
-    "BITF.US": { key: "bitf", name: "Bitfarms", isEuro: false },
-  };
-
-  // 1) Quotes US
-  const symbols = Object.keys(stockMapping);
-  const quoteResponses = await Promise.all(
-    symbols.map(async (sym) => {
-      try {
-        const parsed = await getQuoteFromStooq(sym);
-        return { sym, parsed };
-      } catch {
-        return { sym, parsed: null };
-      }
-    })
-  );
-
-  for (const item of quoteResponses) {
-    const mapping = stockMapping[item.sym];
-    if (!mapping || !item.parsed) continue;
-
-    results[mapping.key] = {
-      name: mapping.name,
-      symbol: item.sym,
-      currentPrice: item.parsed.close,
-      changeDayPct: item.parsed.changeDayPct || 0,
-      isEuro: false,
-      source: "stooq",
-      last: `${item.parsed.date} ${item.parsed.time}`,
-    };
-    stocksSuccess = true;
-  }
-
-  // === MELANION (Yahoo: BTC.MI) => on essaye BTC.MI (Stooq) + fallbacks ===
-  // Objectif: LIVE si quote dispo, sinon CLOSE daily, sinon lastKnown (Blobs)
-  const melanionCandidates = [
-    "BTC.MI",   // ✅ ton code Yahoo
-    "BTC.PA",   // fallback
-    "BTC.FR"    // fallback
-  ];
-
-  let melanionSet = false;
-
-  for (const sym of melanionCandidates) {
-    if (melanionSet) break;
-
-    // 1) quote
-    let q = null;
-    try { q = await getQuoteFromStooq(sym); } catch {}
-
-    if (q) {
-      results.mlnx = {
-        name: "Melanion",
-        symbol: sym,
-        currentPrice: q.close,
-        changeDayPct: q.changeDayPct || 0,
-        isEuro: true,
-        source: "stooq",
-        last: `${q.date} ${q.time}`,
-      };
-      stocksSuccess = true;
-      melanionSet = true;
-      break;
-    }
-
-    // 2) daily close (si quote vide)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1️⃣ LIRE LE CACHE ACTUEL (TOUJOURS)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    let cachedData = {};
     try {
-      const daily = await fetchLastDailyCloseFromStooq(sym.toLowerCase());
-      if (daily) {
-        results.mlnx = {
-          name: "Melanion",
-          symbol: sym,
-          currentPrice: daily.close,
-          changeDayPct: daily.changeDayPct || 0,
-          isEuro: true,
-          source: "stooq",
-          last: `${daily.date} CLOSE`,
-        };
-        stocksSuccess = true;
-        melanionSet = true;
-        break;
+      const raw = await store.get("latest");
+      if (raw) {
+        const cached = JSON.parse(raw);
+        cachedData = cached.data || {};
+        console.log(`[REFRESH] 💾 Cache chargé: ${Object.keys(cachedData).length} actifs`);
       }
-    } catch {}
-  }
-
-  // ✅ GARANTIE "DERNIER COURS CONNU" POUR ACTIONS + MELANION
-  // (si marché fermé / API renvoie rien => on garde le dernier stocké sur le serveur)
-  const alwaysKeep = ["mara","btbt","pypl","bmnr","mstr","bitf","mlnx"];
-  for (const k of alwaysKeep) {
-    if (!results[k] && previousData[k]?.currentPrice) {
-      results[k] = previousData[k];
+    } catch (e) {
+      console.log("[REFRESH] ℹ️ Aucun cache existant");
     }
-  }
 
-  const payload = {
-    success: true,
-    timestamp: new Date().toISOString(),
-    cacheTtlSeconds: 300,
-    stocksSuccess,
-    data: results,
-  };
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2️⃣ RÉCUPÉRER LES NOUVEAUX COURS
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const [cryptoData, stocksData] = await Promise.all([
+      fetchCryptoPrices(),
+      fetchStockPrices()
+    ]);
 
-  await store.set("latest", JSON.stringify(payload));
-  return payload;
-}
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 3️⃣ FUSION INTELLIGENTE
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const finalData = { ...cachedData }; // On part du cache
+    let updateCount = 0;
 
-/* =========================
-   HANDLER (CRON + CLÉ)
-========================= */
+    // 🔥 CRYPTOS : TOUJOURS prioritaires (remplace TOUJOURS le cache)
+    Object.keys(cryptoData).forEach(key => {
+      if (cryptoData[key]?.currentPrice !== null && cryptoData[key]?.currentPrice !== undefined) {
+        finalData[key] = cryptoData[key];
+        updateCount++;
+        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = $${cryptoData[key].currentPrice} (NOUVEAU)`);
+      } else if (cachedData[key]) {
+        console.log(`[REFRESH] ⚠️ ${key.toUpperCase()} = $${cachedData[key].currentPrice} (CACHE - API FAILED)`);
+      }
+    });
 
-export const handler = async (event) => {
-  const key = event?.queryStringParameters?.key;
-  const isCron = event?.headers?.["x-nf-scheduled"] === "true";
+    // 🔥 ACTIONS : Nouveau cours > Ancien cours, sinon garde l'ancien
+    Object.keys(stocksData).forEach(key => {
+      if (stocksData[key]?.currentPrice !== null && stocksData[key]?.currentPrice !== undefined) {
+        // ✅ Nouveau cours disponible
+        finalData[key] = stocksData[key];
+        updateCount++;
+        const currency = stocksData[key].isEuro ? '€' : '$';
+        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = ${currency}${stocksData[key].currentPrice} (NOUVEAU)`);
+      } else if (cachedData[key]) {
+        // ⏸️ Pas de nouveau cours, on garde l'ancien
+        const currency = cachedData[key].isEuro ? '€' : '$';
+        console.log(`[REFRESH] ⏸️ ${key.toUpperCase()} = ${currency}${cachedData[key].currentPrice} (CACHE - Marché fermé)`);
+      } else {
+        // ❌ Ni nouveau ni cache (première fois)
+        console.log(`[REFRESH] ❌ ${key.toUpperCase()} = Pas de données disponibles`);
+      }
+    });
 
-  if (!isCron && key !== process.env.REFRESH_KEY) {
-    return {
-      statusCode: 401,
-      body: JSON.stringify({ ok: false, error: "Unauthorized" }),
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 4️⃣ SAUVEGARDE (TOUJOURS)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const payload = {
+      success: true,
+      timestamp: new Date().toISOString(),
+      data: finalData,
+      meta: {
+        source: source,
+        updated: updateCount,
+        total: Object.keys(finalData).length
+      }
     };
-  }
 
-  try {
-    const payload = await refreshAndStore(event);
+    await store.set("latest", JSON.stringify(payload));
+
+    console.log(`[REFRESH] 💾 Sauvegardé: ${updateCount} nouveaux / ${Object.keys(finalData).length} total`);
+
     return {
       statusCode: 200,
-      body: JSON.stringify({ ok: true, timestamp: payload.timestamp }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        success: true,
+        timestamp: payload.timestamp,
+        updated: updateCount,
+        total: Object.keys(finalData).length
+      })
     };
-  } catch (e) {
+
+  } catch (error) {
+    console.error("[REFRESH] ❌ Erreur:", error);
     return {
       statusCode: 500,
-      body: JSON.stringify({ ok: false, error: e?.message || String(e) }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        success: false, 
+        error: error.message 
+      })
     };
   }
 };
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CRYPTOS (TOUJOURS 24/7)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function fetchCryptoPrices() {
+  try {
+    const response = await fetch(
+      `${COINGECKO_API}?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+
+    if (!response.ok) {
+      throw new Error(`CoinGecko HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    
+    console.log("[CRYPTO] Réponse CoinGecko:", JSON.stringify(data));
+
+    return {
+      bitcoin: {
+        currentPrice: data.bitcoin?.usd || null,
+        change24h: data.bitcoin?.usd_24h_change || null,
+        isEuro: false
+      },
+      ethereum: {
+        currentPrice: data.ethereum?.usd || null,
+        change24h: data.ethereum?.usd_24h_change || null,
+        isEuro: false
+      }
+    };
+
+  } catch (error) {
+    console.error("[CRYPTO] ❌ Erreur:", error.message);
+    // Retourne des objets vides (pas null) pour trigger le fallback au cache
+    return {
+      bitcoin: { currentPrice: null },
+      ethereum: { currentPrice: null }
+    };
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ACTIONS (Nouveau si dispo, sinon cache)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function fetchStockPrices() {
+  const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF', 'BMNR', 'BTC.MI'];
+  const results = {};
+
+  for (const symbol of symbols) {
+    try {
+      const response = await fetch(
+        `${YAHOO_API}/${symbol}?interval=1m&range=1d`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const quote = data?.chart?.result?.[0];
+      const meta = quote?.meta;
+      const prices = quote?.indicators?.quote?.[0];
+
+      if (meta && prices) {
+        const currentPrice = meta.regularMarketPrice || prices.close?.[prices.close.length - 1];
+        const previousClose = meta.chartPreviousClose || meta.previousClose;
+
+        if (currentPrice) {
+          const changePct = previousClose 
+            ? ((currentPrice - previousClose) / previousClose) * 100 
+            : 0;
+
+          // 🔥 Renomme BTC.MI en "melanion" pour éviter confusion avec Bitcoin
+          const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+          const isEuro = symbol.endsWith('.MI') || symbol.endsWith('.PA');
+
+          results[key] = {
+            currentPrice: currentPrice,
+            changeDayPct: changePct,
+            isEuro: isEuro
+          };
+          
+          const currency = isEuro ? '€' : '$';
+          console.log(`[${symbol}] ✅ ${currency}${currentPrice}`);
+        } else {
+          const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+          results[key] = { currentPrice: null };
+          console.log(`[${symbol}] ⚠️ Pas de prix disponible`);
+        }
+      } else {
+        const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+        results[key] = { currentPrice: null };
+      }
+
+    } catch (error) {
+      console.error(`[${symbol}] ❌`, error.message);
+      const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+      results[key] = { currentPrice: null };
+    }
+  }
+
+  return results;
+}
