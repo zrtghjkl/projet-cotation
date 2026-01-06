@@ -1,6 +1,5 @@
-[functions]
-  node_bundler = "esbuild"
+[build]
+  functions = "netlify/functions"
 
-[[scheduled.functions]]
-  name = "ticker-refresh"
-  schedule = "*/5 * * * *"
+[functions]
+  directory = "netlify/functions"
