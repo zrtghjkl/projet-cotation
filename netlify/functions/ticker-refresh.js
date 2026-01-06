@@ -59,10 +59,12 @@ export const handler = async (event) => {
         // ✅ Nouveau cours disponible
         finalData[key] = stocksData[key];
         updateCount++;
-        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = $${stocksData[key].currentPrice} (NOUVEAU)`);
+        const currency = stocksData[key].isEuro ? '€' : '$';
+        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = ${currency}${stocksData[key].currentPrice} (NOUVEAU)`);
       } else if (cachedData[key]) {
         // ⏸️ Pas de nouveau cours, on garde l'ancien
-        console.log(`[REFRESH] ⏸️ ${key.toUpperCase()} = $${cachedData[key].currentPrice} (CACHE - Marché fermé)`);
+        const currency = cachedData[key].isEuro ? '€' : '$';
+        console.log(`[REFRESH] ⏸️ ${key.toUpperCase()} = ${currency}${cachedData[key].currentPrice} (CACHE - Marché fermé)`);
       } else {
         // ❌ Ni nouveau ni cache (première fois)
         console.log(`[REFRESH] ❌ ${key.toUpperCase()} = Pas de données disponibles`);
@@ -156,7 +158,7 @@ async function fetchCryptoPrices() {
 // ACTIONS (Nouveau si dispo, sinon cache)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function fetchStockPrices() {
-  const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF', 'BMNR'];
+  const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF', 'BMNR', 'BTC.MI'];
   const results = {};
 
   for (const symbol of symbols) {
@@ -184,24 +186,32 @@ async function fetchStockPrices() {
             ? ((currentPrice - previousClose) / previousClose) * 100 
             : 0;
 
-          results[symbol.toLowerCase()] = {
+          // 🔥 Renomme BTC.MI en "melanion" pour éviter confusion avec Bitcoin
+          const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+          const isEuro = symbol.endsWith('.MI') || symbol.endsWith('.PA');
+
+          results[key] = {
             currentPrice: currentPrice,
             changeDayPct: changePct,
-            isEuro: false
+            isEuro: isEuro
           };
           
-          console.log(`[${symbol}] ✅ $${currentPrice}`);
+          const currency = isEuro ? '€' : '$';
+          console.log(`[${symbol}] ✅ ${currency}${currentPrice}`);
         } else {
-          results[symbol.toLowerCase()] = { currentPrice: null };
+          const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+          results[key] = { currentPrice: null };
           console.log(`[${symbol}] ⚠️ Pas de prix disponible`);
         }
       } else {
-        results[symbol.toLowerCase()] = { currentPrice: null };
+        const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+        results[key] = { currentPrice: null };
       }
 
     } catch (error) {
       console.error(`[${symbol}] ❌`, error.message);
-      results[symbol.toLowerCase()] = { currentPrice: null };
+      const key = symbol === 'BTC.MI' ? 'melanion' : symbol.toLowerCase();
+      results[key] = { currentPrice: null };
     }
   }
 
