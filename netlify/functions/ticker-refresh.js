@@ -4,7 +4,6 @@ const COINGECKO_API = 'https://api.coingecko.com/api/v3/simple/price';
 const YAHOO_API = 'https://query1.finance.yahoo.com/v8/finance/chart';
 
 export const handler = async (event) => {
-  // ✅ Détecte si c'est un appel CRON ou manuel
   const isCron = event.headers?.['x-nf-scheduled'] === 'true';
   const source = isCron ? 'CRON' : 'MANUAL';
   
@@ -15,16 +14,15 @@ export const handler = async (event) => {
 
   try {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1️⃣ LIRE LE CACHE ACTUEL (dernier cours connu)
+    // 1️⃣ LIRE LE CACHE ACTUEL (TOUJOURS)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    let currentData = {};
+    let cachedData = {};
     try {
       const raw = await store.get("latest");
       if (raw) {
         const cached = JSON.parse(raw);
-        currentData = cached.data || {};
-        const age = Date.now() - new Date(cached.timestamp).getTime();
-        console.log(`[REFRESH] 💾 Cache actuel: ${Math.round(age / 1000)}s`);
+        cachedData = cached.data || {};
+        console.log(`[REFRESH] 💾 Cache chargé: ${Object.keys(cachedData).length} actifs`);
       }
     } catch (e) {
       console.log("[REFRESH] ℹ️ Aucun cache existant");
@@ -38,52 +36,56 @@ export const handler = async (event) => {
       fetchStockPrices()
     ]);
 
-    console.log("[REFRESH] 📊 Cryptos:", Object.keys(cryptoData));
-    console.log("[REFRESH] 📊 Actions:", Object.keys(stocksData));
-
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 3️⃣ FUSION : Nouveau cours > Ancien cours
+    // 3️⃣ FUSION INTELLIGENTE
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const mergedData = { ...currentData };
+    const finalData = { ...cachedData }; // On part du cache
     let updateCount = 0;
 
-    // Cryptos (toujours live 24/7)
+    // 🔥 CRYPTOS : TOUJOURS prioritaires (remplace TOUJOURS le cache)
     Object.keys(cryptoData).forEach(key => {
-      if (cryptoData[key]?.currentPrice !== null) {
-        mergedData[key] = cryptoData[key];
+      if (cryptoData[key]?.currentPrice !== null && cryptoData[key]?.currentPrice !== undefined) {
+        finalData[key] = cryptoData[key];
         updateCount++;
-        console.log(`[REFRESH] ✅ ${key} = $${cryptoData[key].currentPrice} (crypto)`);
+        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = $${cryptoData[key].currentPrice} (NOUVEAU)`);
+      } else if (cachedData[key]) {
+        console.log(`[REFRESH] ⚠️ ${key.toUpperCase()} = $${cachedData[key].currentPrice} (CACHE - API FAILED)`);
       }
     });
 
-    // Actions (seulement si prix frais < 1h)
+    // 🔥 ACTIONS : Nouveau cours > Ancien cours, sinon garde l'ancien
     Object.keys(stocksData).forEach(key => {
-      if (stocksData[key] !== null && stocksData[key]?.currentPrice !== null) {
-        mergedData[key] = stocksData[key];
+      if (stocksData[key]?.currentPrice !== null && stocksData[key]?.currentPrice !== undefined) {
+        // ✅ Nouveau cours disponible
+        finalData[key] = stocksData[key];
         updateCount++;
-        console.log(`[REFRESH] ✅ ${key} = $${stocksData[key].currentPrice} (action)`);
-      } else if (mergedData[key]) {
-        console.log(`[REFRESH] ⚠️ ${key} = $${mergedData[key].currentPrice} (cache)`);
+        console.log(`[REFRESH] ✅ ${key.toUpperCase()} = $${stocksData[key].currentPrice} (NOUVEAU)`);
+      } else if (cachedData[key]) {
+        // ⏸️ Pas de nouveau cours, on garde l'ancien
+        console.log(`[REFRESH] ⏸️ ${key.toUpperCase()} = $${cachedData[key].currentPrice} (CACHE - Marché fermé)`);
+      } else {
+        // ❌ Ni nouveau ni cache (première fois)
+        console.log(`[REFRESH] ❌ ${key.toUpperCase()} = Pas de données disponibles`);
       }
     });
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 4️⃣ SAUVEGARDE DANS LE BLOB (TOUJOURS)
+    // 4️⃣ SAUVEGARDE (TOUJOURS)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const payload = {
       success: true,
       timestamp: new Date().toISOString(),
-      data: mergedData,
+      data: finalData,
       meta: {
         source: source,
         updated: updateCount,
-        total: Object.keys(mergedData).length
+        total: Object.keys(finalData).length
       }
     };
 
     await store.set("latest", JSON.stringify(payload));
 
-    console.log(`[REFRESH] ✅ Blob sauvegardé (${updateCount}/${Object.keys(mergedData).length} mis à jour)`);
+    console.log(`[REFRESH] 💾 Sauvegardé: ${updateCount} nouveaux / ${Object.keys(finalData).length} total`);
 
     return {
       statusCode: 200,
@@ -92,7 +94,7 @@ export const handler = async (event) => {
         success: true,
         timestamp: payload.timestamp,
         updated: updateCount,
-        total: Object.keys(mergedData).length
+        total: Object.keys(finalData).length
       })
     };
 
@@ -110,18 +112,22 @@ export const handler = async (event) => {
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// CRYPTOS (Bitcoin, Ethereum) - 24/7
+// CRYPTOS (TOUJOURS 24/7)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function fetchCryptoPrices() {
   try {
     const response = await fetch(
       `${COINGECKO_API}?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true`,
-      { signal: AbortSignal.timeout(5000) }
+      { signal: AbortSignal.timeout(8000) }
     );
 
-    if (!response.ok) throw new Error(`CoinGecko: ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`CoinGecko HTTP ${response.status}`);
+    }
 
     const data = await response.json();
+    
+    console.log("[CRYPTO] Réponse CoinGecko:", JSON.stringify(data));
 
     return {
       bitcoin: {
@@ -137,27 +143,32 @@ async function fetchCryptoPrices() {
     };
 
   } catch (error) {
-    console.error("[CRYPTO] ❌", error.message);
-    return {};
+    console.error("[CRYPTO] ❌ Erreur:", error.message);
+    // Retourne des objets vides (pas null) pour trigger le fallback au cache
+    return {
+      bitcoin: { currentPrice: null },
+      ethereum: { currentPrice: null }
+    };
   }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ACTIONS (MARA, MSTR, etc.) - Avec vérification fraîcheur
+// ACTIONS (Nouveau si dispo, sinon cache)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function fetchStockPrices() {
   const symbols = ['MARA', 'MSTR', 'BTBT', 'PYPL', 'BITF', 'BMNR'];
   const results = {};
-  const now = Date.now() / 1000;
 
   for (const symbol of symbols) {
     try {
       const response = await fetch(
-        `${YAHOO_API}/${symbol}?interval=1d&range=2d`,
-        { signal: AbortSignal.timeout(5000) }
+        `${YAHOO_API}/${symbol}?interval=1m&range=1d`,
+        { signal: AbortSignal.timeout(8000) }
       );
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
 
       const data = await response.json();
       const quote = data?.chart?.result?.[0];
@@ -167,17 +178,8 @@ async function fetchStockPrices() {
       if (meta && prices) {
         const currentPrice = meta.regularMarketPrice || prices.close?.[prices.close.length - 1];
         const previousClose = meta.chartPreviousClose || meta.previousClose;
-        const marketTime = meta.regularMarketTime;
 
-        // 🔥 Vérification : Prix frais (< 1 heure) ?
-        const ageSeconds = now - marketTime;
-        const ageMinutes = Math.round(ageSeconds / 60);
-        const isFresh = ageSeconds < 3600; // < 1 heure
-
-        console.log(`[${symbol}] $${currentPrice} | Âge: ${ageMinutes}min | Frais: ${isFresh}`);
-
-        if (isFresh) {
-          // ✅ Prix récent (marché ouvert)
+        if (currentPrice) {
           const changePct = previousClose 
             ? ((currentPrice - previousClose) / previousClose) * 100 
             : 0;
@@ -187,15 +189,19 @@ async function fetchStockPrices() {
             changeDayPct: changePct,
             isEuro: false
           };
+          
+          console.log(`[${symbol}] ✅ $${currentPrice}`);
         } else {
-          // ⚠️ Prix obsolète (marché fermé) → On garde l'ancien
-          results[symbol.toLowerCase()] = null;
+          results[symbol.toLowerCase()] = { currentPrice: null };
+          console.log(`[${symbol}] ⚠️ Pas de prix disponible`);
         }
+      } else {
+        results[symbol.toLowerCase()] = { currentPrice: null };
       }
 
     } catch (error) {
       console.error(`[${symbol}] ❌`, error.message);
-      results[symbol.toLowerCase()] = null;
+      results[symbol.toLowerCase()] = { currentPrice: null };
     }
   }
 
